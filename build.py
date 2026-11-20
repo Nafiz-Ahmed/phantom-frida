@@ -1949,11 +1949,24 @@ Transformations and verification boundaries:
 
     with output_transaction(output_dir) as staged_output:
         strip_tool = find_llvm_strip(ndk_path)
-        # Step 5: Build loop
+
+        # Step 5: Build loop — one full configure+build cycle per architecture.
+        # Frida's ./configure writes into a single ./build directory and refuses
+        # to reconfigure if that directory already exists.  We wipe it before
+        # each architecture so the next configure starts from a clean slate.
         for arch in archs:
             log("=" * 60, "HEADER")
             log(f"Building for {arch}", "STEP")
             log("=" * 60, "HEADER")
+
+            # ----------------------------------------------------------------
+            # Wipe the previous arch's build directory so ./configure does not
+            # refuse with "Already configured. Wipe ./build to reconfigure."
+            # ----------------------------------------------------------------
+            build_dir = frida_dir / "build"
+            if build_dir.exists():
+                log(f"Wiping build dir before configuring {arch}...", "STEP")
+                shutil.rmtree(build_dir)
 
             # Configure
             configure_arch(frida_dir, arch, ndk_path)
