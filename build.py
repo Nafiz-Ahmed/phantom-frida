@@ -92,6 +92,10 @@ FORBIDDEN_BINARY_MARKERS = (
 ZYMBIOTE_ARCHITECTURES = ("arm", "arm64", "x86", "x86_64")
 ZYMBIOTE_SOCKET_FIELD_SIZE = 64
 ZYMBIOTE_SOCKET_TOKEN = b"0" * 32
+BINARY_SKIP_EXTENSIONS = {
+    ".o", ".a", ".so", ".gz", ".zip", ".png", ".jpg", ".pyc", ".dex",
+    ".jar", ".class", ".elf", ".wasm", ".dylib", ".dll",
+}
 
 
 class BuildError(RuntimeError):
@@ -148,14 +152,12 @@ def run(
 
 
 def validate_version(value: str) -> str:
-    """Accept only concrete Frida release tags such as 17.16.4."""
     if VERSION_PATTERN.fullmatch(value) is None:
         raise BuildError("Frida version must use the numeric X.Y.Z release format")
     return value
 
 
 def validate_custom_name(value: str) -> str:
-    """Normalize and validate the identifier used in paths, packages, and symbols."""
     normalized = value.lower()
     if NAME_PATTERN.fullmatch(normalized) is None:
         raise BuildError(
@@ -165,14 +167,12 @@ def validate_custom_name(value: str) -> str:
 
 
 def validate_port(value: int | None) -> int | None:
-    """Validate an optional TCP port."""
     if value is not None and not 1 <= value <= 65535:
         raise BuildError("Port must be between 1 and 65535")
     return value
 
 
 def parse_architectures(value: str) -> list[str]:
-    """Parse and validate the requested Android architecture list."""
     architectures = [architecture.strip() for architecture in value.split(",")]
     invalid = [architecture for architecture in architectures if architecture not in ALL_ARCHS]
     if invalid:
@@ -184,7 +184,6 @@ def parse_architectures(value: str) -> list[str]:
 def validate_directory_layout(
     repository_dir: Path, work_dir: Path, output_dir: Path
 ) -> tuple[Path, Path]:
-    """Resolve build paths and reject layouts that publication could destroy."""
     repository_dir = repository_dir.resolve()
     work_dir = work_dir.resolve()
     output_dir = output_dir.resolve()
@@ -197,7 +196,6 @@ def validate_directory_layout(
 
 
 def require_executable(name: str) -> str:
-    """Resolve a mandatory executable or fail with its name."""
     path = shutil.which(name)
     if path is None:
         raise BuildError(f"Required executable is missing: {name}")
@@ -215,13 +213,11 @@ def _android_sdk_roots() -> tuple[Path, ...]:
 
 
 def _sdk_version_key(path: Path) -> tuple[int, ...]:
-    """Sort SDK package paths by their numeric version components."""
     package_dir = path.parent.parent if path.name == "d8.jar" else path.parent
     return tuple(int(component) for component in re.findall(r"\d+", package_dir.name))
 
 
 def find_android_jar() -> Path:
-    """Find the newest available Android platform API JAR."""
     candidates = {
         candidate
         for root in _android_sdk_roots()
@@ -235,7 +231,6 @@ def find_android_jar() -> Path:
 
 
 def find_d8_command() -> list[str]:
-    """Resolve D8 as an executable or its JAR entry point."""
     executable = shutil.which("d8")
     if executable is not None:
         return [executable]
@@ -270,7 +265,6 @@ def find_d8_command() -> list[str]:
 
 
 def validate_build_prerequisites(*, skip_build: bool) -> None:
-    """Fail before downloads or patching when required build tools are absent."""
     for executable in ("git", "java", "javac", "jar"):
         require_executable(executable)
     if not skip_build:
@@ -290,7 +284,6 @@ def detect_frida_major(version: str) -> int:
 
 
 def replace_in_file(filepath: Path, old: str, new: str) -> int:
-    """Replace string in a single file. Returns number of replacements."""
     try:
         content = filepath.read_text(encoding="utf-8", errors="ignore")
     except (PermissionError, IsADirectoryError, OSError):
@@ -304,7 +297,6 @@ def replace_in_file(filepath: Path, old: str, new: str) -> int:
 
 
 def replace_in_tree(root: Path, old: str, new: str, include_build: bool = False) -> int:
-    """Recursively replace string in all text files under root."""
     total = 0
     skip_dirs = {".git", "node_modules", "__pycache__", ".venv"}
     if not include_build:
@@ -316,28 +308,75 @@ def replace_in_tree(root: Path, old: str, new: str, include_build: bool = False)
             fpath = Path(dirpath) / fname
             if fpath.is_symlink():
                 continue
-            # Skip binary files by extension
-            if fpath.suffix in {
-                ".o",
-                ".a",
-                ".so",
-                ".gz",
-                ".zip",
-                ".png",
-                ".jpg",
-                ".pyc",
-                ".dex",
-                ".jar",
-                ".class",
-                ".elf",
-                ".wasm",
-                ".dylib",
-                ".dll",
-            }:
+            if fpath.suffix in BINARY_SKIP_EXTENSIONS:
                 continue
             total += replace_in_file(fpath, old, new)
 
     return total
+
+
+def replace_port_in_tree(root: Path, old_port: int, new_port: int) -> int:
+    """Replace a standalone integer inside text files under `root`.
+
+    Unlike `replace_in_tree`, this only matches `old_port` when it is NOT
+    adjacent to another digit, letter, or underscore. This prevents
+    corrupting `0x27042`, `127042`, `270421`, `frida_27042` etc.
+    """
+    old_str = str(old_port)
+    new_str = str(new_port)
+    pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(old_str) + r"(?![0-9A-Za-z_])")
+
+    total = 0
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "build"}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            if fpath.is_symlink() or fpath.suffix in BINARY_SKIP_EXTENSIONS:
+                continue
+            try:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+            except (PermissionError, IsADirectoryError, OSError):
+                continue
+            matches = pattern.findall(content)
+            if not matches:
+                continue
+            fpath.write_text(pattern.sub(new_str, content), encoding="utf-8")
+            total += len(matches)
+    return total
+
+
+def apply_required_replacement(
+    filepath: Path, old: str, new: str, expected: int, description: str
+) -> None:
+    """Apply a required pattern replacement, tolerating already-patched files.
+
+    A *fresh* source tree contains `old` exactly `expected` times. A source
+    tree that was patched by a previous run (`--skip-clone`) contains `new`
+    instead. In both cases we accept the state, so `--skip-clone` re-runs
+    are idempotent instead of raising "required pattern occurred 0 times".
+    """
+    if not filepath.is_file():
+        raise BuildError(f"Required patch file is missing: {filepath}")
+
+    count = replace_in_file(filepath, old, new)
+
+    try:
+        already = filepath.read_text(encoding="utf-8", errors="ignore").count(new)
+    except (PermissionError, IsADirectoryError, OSError):
+        already = 0
+
+    if count == expected:
+        log(f"  [required] {description}", "OK")
+        return
+    if already >= expected:
+        log(f"  [required] {description}: already patched ({already} match(es))", "INFO")
+        return
+    raise BuildError(
+        f"Required pattern occurred {count} times in {filepath.name}; "
+        f"expected {expected} ({description})"
+    )
 
 
 # ============================================================================
@@ -346,7 +385,6 @@ def replace_in_tree(root: Path, old: str, new: str, include_build: bool = False)
 
 
 def validate_ndk(ndk_dir: Path) -> Path:
-    """Require the exact NDK revision used by the supported build."""
     properties = ndk_dir / "source.properties"
     if not properties.is_file():
         raise BuildError(f"NDK source.properties is missing: {properties}")
@@ -362,7 +400,6 @@ def validate_ndk(ndk_dir: Path) -> Path:
 
 
 def find_llvm_strip(ndk_dir: Path) -> Path:
-    """Locate the host llvm-strip shipped with the validated Android NDK."""
     candidates = sorted(
         candidate
         for prebuilt in (ndk_dir / "toolchains" / "llvm" / "prebuilt").glob("*")
@@ -378,7 +415,6 @@ def find_llvm_strip(ndk_dir: Path) -> Path:
 
 
 def verify_file_checksum(path: Path, expected: str, algorithm: str) -> None:
-    """Verify a file digest without loading a large archive into memory."""
     digest = hashlib.new(algorithm)
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -389,7 +425,6 @@ def verify_file_checksum(path: Path, expected: str, algorithm: str) -> None:
 
 
 def ensure_ndk(work_dir: Path) -> Path:
-    """Download and extract Android NDK if needed."""
     ndk_dir = work_dir / f"android-ndk-{NDK_VERSION}"
     if ndk_dir.exists():
         validate_ndk(ndk_dir)
@@ -436,7 +471,6 @@ def ensure_ndk(work_dir: Path) -> Path:
 
 
 def clone_frida(version: str, work_dir: Path) -> Path:
-    """Clone Frida source at the specified version tag."""
     frida_dir = work_dir / "frida"
     if frida_dir.exists():
         log(f"Frida source already at {frida_dir}", "OK")
@@ -467,15 +501,6 @@ def clone_frida(version: str, work_dir: Path) -> Path:
 
 
 def rename_frida_files(frida_dir: Path, custom_name: str):
-    """
-    Rename files on disk whose names contain 'frida-helper' or 'frida-agent' etc.
-    After global source patches rename references in meson.build/Vala/C files,
-    the actual files on disk must also be renamed to match.
-
-    IMPORTANT: Skip build system files (.symbols, .version, .def, .plist, .xcent)
-    because rollback patches revert their references to original names.
-    Also skip releng/frida_version.py (not renamed by our patches).
-    """
     rename_patterns = [
         ("frida-helper", f"{custom_name}-helper"),
         ("frida-agent", f"{custom_name}-agent"),
@@ -483,10 +508,8 @@ def rename_frida_files(frida_dir: Path, custom_name: str):
         ("frida-server", f"{custom_name}-server"),
     ]
 
-    # Build system file extensions that rollback patches keep with original names
     skip_extensions = {".symbols", ".version", ".def", ".plist", ".xcent"}
     skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "build"}
-    # Specific files to never rename
     skip_names = {"frida_version.py", "frida-version.py"}
     renamed_count = 0
 
@@ -495,7 +518,6 @@ def rename_frida_files(frida_dir: Path, custom_name: str):
         for fname in filenames:
             if fname in skip_names:
                 continue
-            # Skip build system files (rollback patches keep their original names)
             if Path(fname).suffix in skip_extensions:
                 continue
             new_fname = fname
@@ -522,25 +544,16 @@ def _require_success(tool: str, result: subprocess.CompletedProcess[str]) -> Non
 
 
 def rebuild_helper_dex(frida_dir: Path, custom_name: str) -> Path:
-    """Rebuild the Android helper DEX with renamed Java package.
-
-    The pre-compiled helper.dex in the repo contains 're.frida.Helper'.
-    We need to recompile it with the new package name so that:
-    1. The DEX string table doesn't contain 'frida' (binary sweep safe)
-    2. The class name matches what the renamed Vala code expects
-    """
     helper_dir = frida_dir / "subprojects" / "frida-core" / "src" / "android-helper"
     old_pkg_dir = helper_dir / "re" / "frida"
     new_pkg_dir = helper_dir / "re" / custom_name
     java_file = old_pkg_dir / "Helper.java"
 
     if not java_file.exists():
-        # Package might already be renamed (e.g., from cache)
         java_file = new_pkg_dir / "Helper.java"
         if not java_file.exists():
             raise BuildError(f"Required Android helper source is missing: {java_file}")
 
-    # Rename directory: re/frida/ -> re/{name}/
     if old_pkg_dir.exists() and new_pkg_dir.exists():
         raise BuildError(f"Both helper package directories exist: {old_pkg_dir}, {new_pkg_dir}")
     if old_pkg_dir.exists():
@@ -551,10 +564,6 @@ def rebuild_helper_dex(frida_dir: Path, custom_name: str) -> Path:
     if not java_file.exists():
         raise BuildError(f"Required Android helper source is missing after rename: {java_file}")
 
-    # The Java source was already patched by replace_in_tree:
-    #   "package re.frida;" -> "package re.{name};"
-    #   "re.frida.Helper" -> "re.{name}.Helper"
-    # Verify:
     content = java_file.read_text(encoding="utf-8")
     if f"package re.{custom_name};" not in content:
         content = content.replace("package re.frida;", f"package re.{custom_name};")
@@ -636,23 +645,23 @@ def rebuild_helper_dex(frida_dir: Path, custom_name: str) -> Path:
 
 
 def apply_required_file_patches(frida_dir: Path, custom_name: str) -> None:
-    """Apply source contracts that must match the supported Frida source shape."""
     for patch in get_required_file_patches(custom_name):
         target = frida_dir / patch.relative_path
-        if not target.is_file():
-            raise BuildError(f"Required patch file is missing: {patch.relative_path}")
-
-        count = replace_in_file(target, patch.old, patch.new)
-        if count < patch.minimum:
-            raise BuildError(
-                f"Required pattern {patch.old!r} occurred {count} times in "
-                f"{patch.relative_path}; expected at least {patch.minimum}"
-            )
-        log(f"  [required] {patch.relative_path}: {count} replacement(s)", "OK")
+        apply_required_replacement(
+            target,
+            patch.old,
+            patch.new,
+            patch.minimum,
+            f"{patch.relative_path}",
+        )
 
 
 def patch_zymbiote_artifacts(frida_dir: Path, custom_name: str) -> None:
-    """Patch the fixed-size socket field in Frida's tracked helper ELFs."""
+    """Patch the fixed-size socket field in Frida's tracked helper ELFs.
+
+    Idempotent: a re-run with `--skip-clone` on an already-patched tree is
+    treated as success instead of raising.
+    """
     old_socket = b"/frida-zymbiote-" + ZYMBIOTE_SOCKET_TOKEN
     new_socket = f"/{custom_name}-zymbiote-".encode() + ZYMBIOTE_SOCKET_TOKEN
     if len(new_socket) >= ZYMBIOTE_SOCKET_FIELD_SIZE:
@@ -669,23 +678,31 @@ def patch_zymbiote_artifacts(frida_dir: Path, custom_name: str) -> None:
             raise BuildError(f"Required zymbiote artifact is missing: {relative_path}")
 
         data = target.read_bytes()
-        count = data.count(old_field)
-        if count != 1:
-            raise BuildError(
-                f"Required socket field occurred {count} times in {relative_path}; expected 1"
-            )
+        count_old = data.count(old_field)
+        count_new = data.count(new_field)
 
-        patched = data.replace(old_field, new_field)
-        with TemporaryDirectory(dir=target.parent, prefix=".zymbiote-patch-") as temporary:
-            staged = Path(temporary) / target.name
-            staged.write_bytes(patched)
-            shutil.copymode(target, staged)
-            os.replace(staged, target)
-        log(f"  [required] {relative_path}: socket field patched", "OK")
+        if old_field == new_field:
+            log(f"  [required] {relative_path}: socket field unchanged (no-op)", "INFO")
+            continue
+
+        if count_old == 1 and count_new == 0:
+            patched = data.replace(old_field, new_field)
+            with TemporaryDirectory(dir=target.parent, prefix=".zymbiote-patch-") as temporary:
+                staged = Path(temporary) / target.name
+                staged.write_bytes(patched)
+                shutil.copymode(target, staged)
+                os.replace(staged, target)
+            log(f"  [required] {relative_path}: socket field patched", "OK")
+        elif count_old == 0 and count_new == 1:
+            log(f"  [required] {relative_path}: socket field already patched", "INFO")
+        else:
+            raise BuildError(
+                f"Required socket field occurred {count_old} old / {count_new} new "
+                f"times in {relative_path}; expected exactly one"
+            )
 
 
 def apply_source_patches(frida_dir: Path, custom_name: str):
-    """Apply global recursive string replacements across the source tree."""
     log("=" * 60, "HEADER")
     log("PHASE 1: Global source patches", "STEP")
     log("=" * 60, "HEADER")
@@ -703,7 +720,6 @@ def apply_source_patches(frida_dir: Path, custom_name: str):
         else:
             log(f"  {old} -> (not found)", "WARN")
 
-    # Rollback accidental renames of build system files
     log("Rolling back build file renames...", "STEP")
     rollbacks = get_rollback_patches(custom_name)
     for old, new in rollbacks:
@@ -711,17 +727,13 @@ def apply_source_patches(frida_dir: Path, custom_name: str):
         if count:
             log(f"  [rollback] {old} ({count})", "INFO")
 
-    # Rename actual files on disk to match source references
     rename_frida_files(frida_dir, custom_name)
-
-    # Rebuild helper DEX with renamed Java package
     rebuild_helper_dex(frida_dir, custom_name)
 
     log("Global source patches complete", "OK")
 
 
 def apply_targeted_patches(frida_dir: Path, custom_name: str, frida_major: int):
-    """Apply patches to specific files (memfd, libc hooks, SELinux, build system)."""
     log("=" * 60, "HEADER")
     log("PHASE 2: Targeted file patches", "STEP")
     log("=" * 60, "HEADER")
@@ -729,7 +741,6 @@ def apply_targeted_patches(frida_dir: Path, custom_name: str, frida_major: int):
     cap_name = custom_name[0].upper() + custom_name[1:]
     core_dir = frida_dir / "subprojects" / "frida-core"
 
-    # --- memfd_create: hide agent name in /proc/pid/fd ---
     memfd_cfg = MEMFD_PATCHES.get(frida_major, MEMFD_PATCHES[17])
     memfd_file = core_dir / memfd_cfg["file"]
     if memfd_file.exists():
@@ -741,13 +752,11 @@ def apply_targeted_patches(frida_dir: Path, custom_name: str, frida_major: int):
     else:
         log(f"  memfd file missing: {memfd_cfg['file']}", "WARN")
 
-    # --- SELinux labels (in linjector.vala for 17.x) ---
     for old, new in SELINUX_PATCHES(custom_name):
         count = replace_in_tree(frida_dir, old, new)
         if count:
             log(f"  SELinux: {old} -> {new} ({count})", "OK")
 
-    # --- Build system files ---
     targets = {
         "server_meson": core_dir / "server" / "meson.build",
         "compat_build": core_dir / "compat" / "build.py",
@@ -1232,35 +1241,38 @@ def apply_strict_wx_patch(frida_dir: Path, custom_name: str) -> None:
             "add remote mprotect call",
         ),
     )
+
     for relative_path, old, new, expected_count, description in patches:
-        count = replace_in_file(frida_dir / relative_path, old, new)
-        if count != expected_count:
-            raise BuildError(
-                f"Strict W^X pattern occurred {count} times in "
-                f"{relative_path.as_posix()}; expected {expected_count}"
-            )
+        apply_required_replacement(
+            frida_dir / relative_path, old, new, expected_count, description
+        )
+        # Log as "required" style already (helper logs internally)
         log(f"  [required] {relative_path.as_posix()}: {description}", "OK")
 
 
 def apply_port_patches(frida_dir: Path, port: int | None) -> None:
     """Apply only the configured listening-port replacement."""
-    if port is not None and port != 27042:
-        port_patches = get_port_patches(port)
-        for patch in port_patches:
-            for fpath in patch["files"]:
-                full_path = frida_dir / fpath
-                if full_path.exists():
-                    count = replace_in_file(full_path, patch["pattern"], patch["replacement"])
-                    if count:
-                        log(f"  Port: {patch['description']} in {Path(fpath).name} ({count})", "OK")
-        # Also do a global sweep for the port number in less obvious places
-        count = replace_in_tree(frida_dir / "subprojects" / "frida-core", "27042", str(port))
-        if count:
-            log(f"  Port: global sweep found {count} more occurrences", "OK")
+    if port is None or port == 27042:
+        return
+
+    port_patches = get_port_patches(port)
+    for patch in port_patches:
+        for fpath in patch["files"]:
+            full_path = frida_dir / fpath
+            if full_path.exists():
+                count = replace_in_file(full_path, patch["pattern"], patch["replacement"])
+                if count:
+                    log(f"  Port: {patch['description']} in {Path(fpath).name} ({count})", "OK")
+
+    # Global sweep — standalone-number match only (avoids 0x27042 / 127042 corruption)
+    count = replace_port_in_tree(
+        frida_dir / "subprojects" / "frida-core", 27042, port
+    )
+    if count:
+        log(f"  Port: global standalone-number sweep found {count} more occurrences", "OK")
 
 
 def apply_extended_patches(frida_dir: Path, custom_name: str, port: int | None):
-    """Apply extended anti-detection patches beyond ajeossida."""
     log("=" * 60, "HEADER")
     log("PHASE 2.5: Extended anti-detection patches", "STEP")
     log("=" * 60, "HEADER")
@@ -1269,21 +1281,12 @@ def apply_extended_patches(frida_dir: Path, custom_name: str, port: int | None):
 
     apply_port_patches(frida_dir, port)
 
-    # --- D-Bus interface names ---
-    # NOTE: Transport/D-Bus interface renames (re.frida.HostSession etc.) are DISABLED.
-    # These interface names are part of the Frida client-server protocol.
-    # Renaming them on the server breaks communication with the standard frida client.
-    # They are NOT visible to other apps (only over USB/TCP channel), so not a detection vector.
-    # The D-Bus service name (re.frida.server) IS renamed by global source patches — that's safe.
-
-    # --- Selected GType identifiers ---
     internal_patches = get_internal_patches(custom_name, cap_name)
     for old, new in internal_patches:
         count = replace_in_tree(frida_dir, old, new)
         if count:
             log(f"  Internal: {old} -> {new} ({count})", "OK")
 
-    # --- Temp file paths ---
     temp_patches = get_temp_path_patches(custom_name)
     for old, new in temp_patches:
         count = replace_in_tree(frida_dir, old, new)
@@ -1294,7 +1297,6 @@ def apply_extended_patches(frida_dir: Path, custom_name: str, port: int | None):
 
 
 def apply_stability_fixes(frida_dir: Path, frida_major: int):
-    """Apply optional stability/crash fixes."""
     log("Applying stability fixes...", "STEP")
 
     core_dir = frida_dir / "subprojects" / "frida-core"
@@ -1310,10 +1312,8 @@ def apply_stability_fixes(frida_dir: Path, frida_major: int):
                 else:
                     log(f"  Pattern not found: {patch['description']}", "WARN")
 
-    # DirListCloaker interceptor detach — safe to disable to prevent crash
     cloak = core_dir / "lib" / "payload" / "cloak.vala"
     if cloak.exists():
-        # 17.x: DirListCloaker uses Gum.Interceptor.detach in destructor
         old = "Gum.Interceptor.obtain ().detach (listener);"
         new = "// Gum.Interceptor.obtain ().detach (listener);"
         count = replace_in_file(cloak, old, new)
@@ -1324,16 +1324,15 @@ def apply_stability_fixes(frida_dir: Path, frida_major: int):
 
 
 # ============================================================================
-# PHASE 3: Post-build patches (after first compilation)
+# PHASE 3: Post-build patches
 # ============================================================================
 
 
 def apply_post_build_patches(frida_dir: Path, custom_name: str):
-    """Patch frida_agent_main symbol (generated during first build).
+    """Rename frida_agent_main → {name}_agent_main in source AND build tree.
 
-    Must include build/ directory because:
-    - agent-glue.c (source) CALLS frida_agent_main
-    - meson-generated_agent.c (build output) DEFINES frida_agent_main
+    agent-glue.c (source) CALLS frida_agent_main.
+    meson-generated_agent.c (build output) DEFINES frida_agent_main.
     Both must be renamed together, otherwise linker error.
     """
     log("PHASE 3: Post-build patches (frida_agent_main)...", "STEP")
@@ -1343,14 +1342,32 @@ def apply_post_build_patches(frida_dir: Path, custom_name: str):
     log(f"  frida_agent_main -> {custom_name}_agent_main ({count})", "OK")
 
 
+def revert_post_build_patches(frida_dir: Path, custom_name: str) -> None:
+    """Undo Phase 3 before the NEXT architecture's first build.
+
+    Phase 3 renames frida_agent_main → {name}_agent_main in BOTH the source
+    tree (agent-glue.c) and the build tree. The build tree gets wiped between
+    architectures, and valac regenerates agent.c/agent.h with the ORIGINAL
+    `frida_agent_main`. If we don't revert agent-glue.c, the next arch's first
+    build fails with:
+
+        agent-glue.c:81:3: error: call to undeclared function
+        '{name}_agent_main'; ISO C99 and later do not support implicit
+        function declarations
+
+    This function is a no-op on fresh source.
+    """
+    count = replace_in_tree(frida_dir, f"{custom_name}_agent_main", "frida_agent_main")
+    if count:
+        log(f"  Reverted {custom_name}_agent_main -> frida_agent_main ({count})", "INFO")
+
+
 # ============================================================================
-# PHASE 4: Binary-level patches (after second compilation)
+# PHASE 4: Binary-level patches (after compilation)
 # ============================================================================
 
 
 def find_dex_regions(data: bytes) -> list[tuple[int, int]]:
-    """Find embedded DEX sections in binary data by scanning for DEX magic.
-    Returns list of (start, end) byte ranges to protect from modification."""
     regions = []
     dex_magics = [b"dex\n035\x00", b"dex\n037\x00", b"dex\n038\x00", b"dex\n039\x00"]
     for magic in dex_magics:
@@ -1359,24 +1376,28 @@ def find_dex_regions(data: bytes) -> list[tuple[int, int]]:
             pos = data.find(magic, idx)
             if pos == -1:
                 break
-            # Read header_size and file_size from DEX header
+            valid = False
             if pos + 0x28 < len(data):
                 file_size = struct.unpack_from("<I", data, pos + 0x20)[0]
                 header_size = struct.unpack_from("<I", data, pos + 0x24)[0]
-                # Valid DEX: header_size=112 (0x70), file_size > header_size
-                if header_size == 112 and file_size > 112 and file_size < 10_000_000:
+                if (
+                    header_size == 112
+                    and 112 < file_size < 10_000_000
+                    and pos + file_size <= len(data)
+                ):
                     regions.append((pos, pos + file_size))
                     log(
                         f"    [dex] Protected DEX region: "
                         f"0x{pos:08x}-0x{pos + file_size:08x} ({file_size} bytes)",
                         "INFO",
                     )
-            idx = pos + 8
+                    valid = True
+            # Advance past the entire region when valid, otherwise just past magic
+            idx = pos + file_size if valid else pos + 8
     return regions
 
 
 def find_elf_alloc_regions(data: bytes) -> list[tuple[int, int]]:
-    """Return file ranges for ELF SHF_ALLOC sections, or the full range for non-ELF data."""
     if not data.startswith(b"\x7fELF"):
         return [(0, len(data))]
     if len(data) < 64:
@@ -1440,7 +1461,13 @@ def replace_bytes_in_regions(
     skip_regions: list[tuple[int, int]],
 ) -> tuple[bytes, int]:
     """Replace a same-length pattern only inside included, non-protected file ranges."""
-    assert len(old) == len(new), "Replacement must be same length"
+    if len(old) != len(new):
+        raise BuildError(
+            f"Binary patch is not same-length ({len(old)} vs {len(new)} bytes)"
+        )
+    if len(old) == 0:
+        return data, 0
+
     result = bytearray(data)
     count = 0
     offset = 0
@@ -1460,7 +1487,9 @@ def replace_bytes_in_regions(
 
 def apply_binary_patches(binary_path: Path, custom_name: str, extended: bool = False):
     """Apply hex-level patches to compiled binaries.
-    DEX-aware: protects embedded DEX sections from string sweep corruption."""
+
+    DEX-aware: protects embedded DEX sections from string-sweep corruption.
+    """
     data = binary_path.read_bytes()
     original_size = len(data)
     patched = False
@@ -1480,8 +1509,6 @@ def apply_binary_patches(binary_path: Path, custom_name: str, extended: bool = F
                 log(f"    {description} ({count}x in SHF_ALLOC)", "OK")
                 patched = True
 
-    # Extended: sweep for residual "frida" strings in binary
-    # MUST skip DEX regions to avoid corrupting embedded helper DEX
     if extended:
         for old_hex, new_hex, description in get_binary_string_patches(custom_name):
             old_bytes = bytes.fromhex(old_hex)
@@ -1495,7 +1522,11 @@ def apply_binary_patches(binary_path: Path, custom_name: str, extended: bool = F
                     patched = True
 
     if patched:
-        assert len(data) == original_size, "Binary size changed — patches are not same-length!"
+        if len(data) != original_size:
+            raise BuildError(
+                f"Binary size changed after patching: {original_size} -> {len(data)} "
+                f"({binary_path.name}); patches must be same-length"
+            )
         binary_path.write_bytes(data)
 
 
@@ -1524,7 +1555,6 @@ def build_frida(frida_dir: Path, ndk_path: Path):
 
 
 def strip_binary(binary_path: Path, strip_tool: Path) -> None:
-    """Remove symbols and non-runtime sections from a staged shared library."""
     before = binary_path.stat().st_size
     run([strip_tool, "--strip-unneeded", binary_path])
     after = binary_path.stat().st_size
@@ -1538,7 +1568,6 @@ def strip_binary(binary_path: Path, strip_tool: Path) -> None:
 
 @contextmanager
 def output_transaction(output_dir: Path) -> Iterator[Path]:
-    """Replace the complete output set only after every build step succeeds."""
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     if output_dir.exists() and not output_dir.is_dir():
         raise BuildError(f"Output path is not a directory: {output_dir}")
@@ -1572,7 +1601,6 @@ def collect_artifacts(
     *,
     strip_tool: Path | None = None,
 ) -> list[Path]:
-    """Stage, verify, and promote mandatory build artifacts."""
     log(f"Collecting artifacts for {arch}...", "STEP")
 
     arch_short = arch.replace("android-", "")
@@ -1583,7 +1611,6 @@ def collect_artifacts(
             candidate = base / pattern
             if candidate.is_file():
                 return candidate
-        # List directory for debugging
         if base.exists():
             log(f"    Looking in {base}:", "INFO")
             for f in sorted(base.iterdir()):
@@ -1698,7 +1725,6 @@ def collect_artifacts(
 
 
 def scan_forbidden_markers(binary_path: Path) -> dict[str, int]:
-    """Count runtime markers that indicate an invalid output artifact."""
     if not binary_path.is_file():
         raise BuildError(f"Binary artifact is missing: {binary_path}")
     data = binary_path.read_bytes()
@@ -1710,7 +1736,6 @@ def scan_forbidden_markers(binary_path: Path) -> dict[str, int]:
 
 
 def verify_binary(binary_path: Path) -> None:
-    """Reject compiled artifacts containing known forbidden runtime markers."""
     findings = scan_forbidden_markers(binary_path)
     if findings:
         details = ", ".join(f"{marker} x{count}" for marker, count in findings.items())
@@ -1719,7 +1744,6 @@ def verify_binary(binary_path: Path) -> None:
 
 
 def git_revision(path: Path) -> str:
-    """Return the exact Git revision for a repository or submodule."""
     result = run(["git", "-C", path, "rev-parse", "HEAD"], capture_output=True)
     revision = (result.stdout or "").strip()
     if not revision:
@@ -1737,7 +1761,6 @@ def create_build_info(
     architectures: list[str],
     strict_wx: bool = False,
 ) -> dict[str, object]:
-    """Create release provenance for the builder and upstream source revisions."""
     repository = os.environ.get("GITHUB_REPOSITORY")
     run_id = os.environ.get("GITHUB_RUN_ID")
     workflow_url = (
@@ -1769,7 +1792,6 @@ def write_release_assets(
     architectures: list[str],
     strict_wx: bool = False,
 ) -> tuple[Path, Path]:
-    """Write deterministic metadata JSON and checksums for release artifacts."""
     output_dir.mkdir(parents=True, exist_ok=True)
     info_path = output_dir / "build-info.json"
     sums_path = output_dir / "SHA256SUMS"
@@ -1872,7 +1894,6 @@ Transformations and verification boundaries:
 
     args = parser.parse_args()
 
-    # Validate
     version = validate_version(args.version)
     frida_major = detect_frida_major(version)
     custom_name = validate_custom_name(args.name)
@@ -1880,7 +1901,6 @@ Transformations and verification boundaries:
     port = validate_port(args.port)
     validate_build_prerequisites(skip_build=args.skip_build)
 
-    # Directories
     script_dir = Path(__file__).parent.resolve()
     work_dir, output_dir = validate_directory_layout(
         script_dir,
@@ -1889,7 +1909,6 @@ Transformations and verification boundaries:
     )
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Banner
     log("=" * 60, "HEADER")
     log("Custom Frida Builder", "HEADER")
     log("=" * 60, "HEADER")
@@ -1902,14 +1921,12 @@ Transformations and verification boundaries:
     log(f"  Work dir: {work_dir}", "INFO")
     log(f"  Output:   {output_dir}", "INFO")
 
-    # Step 1: NDK
     if args.ndk_path:
         ndk_path = validate_ndk(Path(args.ndk_path).resolve())
     else:
         ndk_path = ensure_ndk(work_dir)
     log(f"  NDK:      {ndk_path}", "INFO")
 
-    # Step 2: Clone
     frida_dir = work_dir / "frida"
     if not args.skip_clone:
         if frida_dir.exists():
@@ -1921,19 +1938,17 @@ Transformations and verification boundaries:
             raise BuildError("--skip-clone requires existing source in work-dir")
         log(f"Using existing source at {frida_dir}", "OK")
 
-    # Step 3: Source patches
+    # ---- Phase 1 + 2 (global; run once) ----
     apply_source_patches(frida_dir, custom_name)
     apply_targeted_patches(frida_dir, custom_name, frida_major)
     if args.strict_wx:
         apply_strict_wx_patch(frida_dir, custom_name)
 
-    # Step 3.5: Extended patches
     if args.extended:
         apply_extended_patches(frida_dir, custom_name, port)
     elif port:
         apply_port_patches(frida_dir, port)
 
-    # Step 4: Stability fixes
     if args.temp_fixes:
         apply_stability_fixes(frida_dir, frida_major)
 
@@ -1950,39 +1965,35 @@ Transformations and verification boundaries:
     with output_transaction(output_dir) as staged_output:
         strip_tool = find_llvm_strip(ndk_path)
 
-        # Step 5: Build loop — one full configure+build cycle per architecture.
-        # Frida's ./configure writes into a single ./build directory and refuses
-        # to reconfigure if that directory already exists.  We wipe it before
-        # each architecture so the next configure starts from a clean slate.
+        # ---- Per-architecture build loop ----
         for arch in archs:
             log("=" * 60, "HEADER")
             log(f"Building for {arch}", "STEP")
             log("=" * 60, "HEADER")
 
-            # ----------------------------------------------------------------
-            # Wipe the previous arch's build directory so ./configure does not
-            # refuse with "Already configured. Wipe ./build to reconfigure."
-            # ----------------------------------------------------------------
+            # Frida's ./configure writes into a single ./build directory and refuses
+            # to reconfigure if that directory already exists. Wipe it per arch.
             build_dir = frida_dir / "build"
             if build_dir.exists():
                 log(f"Wiping build dir before configuring {arch}...", "STEP")
                 shutil.rmtree(build_dir)
 
-            # Configure
+            # Undo the previous arch's Phase 3 rename BEFORE valac regenerates
+            # agent.c/agent.h. Without this, agent-glue.c keeps calling
+            # {name}_agent_main while valac emits frida_agent_main -> link error.
+            revert_post_build_patches(frida_dir, custom_name)
+
             configure_arch(frida_dir, arch, ndk_path)
 
-            # First build
             log("First build...", "STEP")
             build_frida(frida_dir, ndk_path)
 
-            # Post-build patches (frida_agent_main appears only after first build)
+            # Phase 3 rename (source + build tree)
             apply_post_build_patches(frida_dir, custom_name)
 
-            # Second build (incremental — only recompiles files with patched symbol)
             log("Second build (incremental)...", "STEP")
             build_frida(frida_dir, ndk_path)
 
-            # Collect and binary-patch artifacts
             collect_artifacts(
                 frida_dir,
                 arch,
@@ -1993,7 +2004,6 @@ Transformations and verification boundaries:
                 strip_tool=strip_tool,
             )
 
-        # Step 6: Verification
         if args.verify:
             log("=" * 60, "HEADER")
             log("Verification: scanning for residual 'frida' strings...", "STEP")
@@ -2012,7 +2022,6 @@ Transformations and verification boundaries:
             strict_wx=args.strict_wx,
         )
 
-    # Done
     log("=" * 60, "HEADER")
     log("BUILD COMPLETE", "OK")
     log(f"Artifacts in: {output_dir}", "OK")
@@ -2020,7 +2029,6 @@ Transformations and verification boundaries:
         size_mb = f.stat().st_size / (1024 * 1024)
         log(f"  {f.name} ({size_mb:.1f} MB)", "OK")
 
-    # Usage hint
     log("", "INFO")
     log("To deploy:", "STEP")
     arch_short = archs[0].replace("android-", "")
