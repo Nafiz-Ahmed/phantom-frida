@@ -374,8 +374,8 @@ def apply_required_replacement(
         log(f"  [required] {description}: already patched ({already} match(es))", "INFO")
         return
     raise BuildError(
-        f"Required pattern occurred {count} times in {filepath.name}; "
-        f"expected {expected} ({description})"
+        f"Required pattern {old!r} occurred {count} times in "
+        f"{filepath}; expected {expected} ({description})"
     )
 
 
