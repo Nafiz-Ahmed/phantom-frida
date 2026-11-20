@@ -19,9 +19,11 @@ jobs:
       - name: Sync with upstream
         env:
           TARGET_BRANCH: master
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
         run: |
           git remote add upstream https://github.com/TheQmaks/phantom-frida.git
           git fetch upstream
           git checkout -B "$TARGET_BRANCH" "origin/$TARGET_BRANCH"
           git merge "upstream/$TARGET_BRANCH" --ff-only || git merge "upstream/$TARGET_BRANCH" --no-edit
-          git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" "$TARGET_BRANCH"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" "$TARGET_BRANCH"
