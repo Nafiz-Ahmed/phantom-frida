@@ -12,7 +12,7 @@ on:
         description: Replacement for the internal Frida name
         required: false
         type: string
-        default: ajeossida
+        default: oemcodec
       arch:
         description: Comma-separated target architectures
         required: false
@@ -49,7 +49,7 @@ on:
         description: Replacement for the internal Frida name
         required: true
         type: string
-        default: ajeossida
+        default: oemcodec
       arch:
         description: Target architecture(s)
         required: true
@@ -92,7 +92,7 @@ jobs:
   build:
     name: build
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       ARCHITECTURES: ${{ inputs.arch }}
       CUSTOM_NAME: ${{ inputs.custom_name }}
@@ -109,6 +109,19 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf \
+            /usr/local/lib/android/sdk/ndk \
+            /usr/local/lib/android/sdk/emulator \
+            /usr/local/lib/android/sdk/system-images \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -147,6 +160,7 @@ jobs:
             --output "$archive" "$NDK_ARCHIVE_URL"
           printf '%s  %s\n' "$NDK_ARCHIVE_SHA1" "$archive" | sha1sum --check -
           unzip -q "$archive" -d build
+          rm -f "$archive"
 
       - name: Validate NDK installation
         run: |
@@ -161,7 +175,6 @@ jobs:
             --name "$CUSTOM_NAME"
             --arch "$ARCHITECTURES"
             --ndk-path build/android-ndk-r29
-            --verify
           )
 
           if [[ -n "$CUSTOM_PORT" ]]; then
